@@ -1,0 +1,36 @@
+## 有关「 OpenBayes 配置文件」的最新说明，请查阅 https://openbayes.com/docs/cli/config-file/
+
+## data_bindings
+#  指绑定的数据，支持「容器输出」以及「数据集」，最多同时绑定三个
+#
+#  一个完整的 data_bindings 样例如下：
+#
+#    data_bindings:
+#      - data: openbayes/mnist/1
+#        path: /input0
+#      - data: openbayes/jobs/jfaqJeLMcPM/output
+#        path: output
+#
+#  亦可将 data_bindings 替换成 bindings， 简写成如下样例：
+#
+#    bindings:
+#      - openbayes/mnist/1:/input0
+#      - openbayes/jobs/jfaqJeLMcPM/output:/output
+#
+data_bindings: []
+
+## resource
+#  指使用什么算力容器，通过命令 bayes gear resource 可以看到支持的算力类型
+#
+resource: cpu
+
+train:
+  lr: 0.0002
+model:
+  Trainable: True
+  model_type: pano_generation_outpaint
+  guidance_scale: 9.
+  model_id: stabilityai/stable-diffusion-2-inpainting
+  single_image_ft: False
+  diff_timestep: 50
+    

@@ -6,7 +6,7 @@ from PIL import Image
 from transformers import CLIPTextModel, CLIPTokenizer
 import numpy as np
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from .models.pano.MVGenModel import MultiViewBaseModel
+from models.pano.MVGenModel import MultiViewBaseModel
 from einops import rearrange
 
 
@@ -31,14 +31,15 @@ class PanoOutpaintGenerator(pl.LightningModule):
         self.vae, self.scheduler, unet = self.load_model(
             config['model']['model_id'])
 
-
+        
 
         self.mv_base_model = MultiViewBaseModel(
             unet, config['model'])
-        #self.trainable_params = self.mv_base_model.trainable_parameters
-        self.trainable_params = [(list(self.text_encoder.parameters())+list(self.vae.parameters()),1)]
-        self.mv_base_model.require_grad = False
+        self.trainable_params = self.mv_base_model.trainable_parameters
+        #self.trainable_params = [(list(self.text_encoder.parameters())+list(self.vae.parameters()),1)]
+        
         self.save_hyperparameters()
+        
        
     def load_model(self, model_id):
         vae = AutoencoderKL.from_pretrained(
@@ -118,11 +119,12 @@ class PanoOutpaintGenerator(pl.LightningModule):
         masked_image_latents = self.encode_image(masked_image, self.vae)
         
         return mask, masked_image_latents
-    def prepare_mask_image(self, images):
+    def prepare_mask_image(self, images,meta_mask):
         bs, m, _, h, w = images.shape
-        mask=torch.zeros(bs, m, 1, h, w, device=images.device)
-        #mask[:,0]=0
-        masked_image=images*(mask<0.5)
+        mask=torch.ones(bs, m, 1, h, w, device=images.device)
+        mask[:,0]=meta_mask
+        masked_image=images*(mask>0.5)
+        self.masked_image = masked_image
         mask_latnets=[]
         masked_image_latents=[]
         for i in range(m):
@@ -154,18 +156,21 @@ class PanoOutpaintGenerator(pl.LightningModule):
             'R': batch['R'].to(device),
             "T": batch['T'].to(device),
             "Depth": batch['depths'].to(device),
+            "mask": batch['mask'].to(device),
+            "homographys": batch['homographys'].to(device).float(),
         }
+
         images=batch['images'].to(device)
-        blur_images = batch['blur_images'].to(device) # input, blur image, condition mask
+        blur_images = batch['dark_imgs'].to(device) # input, blur image, condition mask
 
-        images=rearrange(images, 'bs m h w c -> bs m c h w')
-        blur_images=rearrange(blur_images, 'bs m h w c -> bs m c h w')
+        #images=rearrange(images, 'bs m h w c -> bs m c h w')
+        #blur_images=rearrange(blur_images, 'bs m c h w -> bs m c h w')
 
-        mask_latnets, masked_image_latents=self.prepare_mask_image(blur_images) 
+        mask_latnets, masked_image_latents=self.prepare_mask_image(blur_images,meta["mask"]) 
         # prepare mask via the depth difference 
         
         prompt_embds = []
-        for prompt in batch['prompt']:
+        for prompt in batch['prompts']:
             prompt_embds.append(self.encode_text(
                 prompt, device)[0])
         m=images.shape[1]
@@ -185,8 +190,7 @@ class PanoOutpaintGenerator(pl.LightningModule):
         # b,m,c,h,w 
         # the input should be latents_input,
         latents_input = torch.cat([noise_z, mask_latnets, masked_image_latents], dim=2)
-        with torch.no_grad():
-            denoise = self.mv_base_model(
+        denoise = self.mv_base_model(
                 latents_input, t, prompt_embds, meta)
         target = noise
        
@@ -204,11 +208,14 @@ class PanoOutpaintGenerator(pl.LightningModule):
         K = torch.cat([batch['K']]*2)[:,:,:3,:3]
         T = torch.cat([batch['R']]*2)[:,:,:3,3:]
         depth = torch.cat([batch['depths']]*2)
+        masks = torch.cat([batch["mask"]]*2)
         meta = {
             'K': K,
             'R': R,
             "T": T,
             "Depth": depth,
+            "mask": masks.float().to(self.device),
+            "homographys": torch.cat([batch['homographys'].float()]*2),
         }
 
         return latents, timestep, prompt_embd, meta
@@ -230,26 +237,27 @@ class PanoOutpaintGenerator(pl.LightningModule):
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         images_pred = self.inference(batch)
-        images = ((batch['images']/2+0.5)
-                          * 255).cpu().numpy().astype(np.uint8)
-        blur_images = ((batch['blur_images']/2+0.5)
-                          * 255).cpu().numpy().astype(np.uint8)
-      
+        #images = ((batch['images']/2+0.5)
+        #                  * 255).cpu()
+        #blur_images = ((batch['dark_imgs']/2+0.5)
+        #                  * 255).cpu()
+        return batch["dark_imgs"],images_pred,batch["imgs"]
         # compute image & save
-        if self.trainer.global_rank == 0:
-            self.save_image(images_pred, images,blur_images, batch['prompt'], batch_idx)
+        #if self.trainer.global_rank == 0:
+        #    self.save_image(images_pred, images,blur_images, batch['prompt'], batch_idx)
     
 
 
     @torch.no_grad()
     def inference(self, batch):
-        images = batch['blur_images']
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        images = batch['dark_imgs'].to(device)
 
+        mask = batch["mask"]
+
+        bs, m, _,h, w = images.shape
         
-
-        bs, m, h, w, _ = images.shape
-        images=rearrange(images, 'bs m h w c -> bs m c h w')
-        mask_latnets, masked_image_latents=self.prepare_mask_image(images)
+        mask_latnets, masked_image_latents=self.prepare_mask_image(images,mask)
         
         device = images.device
 
@@ -257,7 +265,7 @@ class PanoOutpaintGenerator(pl.LightningModule):
             bs, m, 4, h//8, w//8, device=device)
 
         prompt_embds = []
-        for prompt in batch['prompt']:
+        for prompt in batch['prompts']:
             prompt_embds.append(self.encode_text(
                 prompt, device)[0])
         prompt_embds = torch.stack(prompt_embds, dim=1)
@@ -335,4 +343,7 @@ class PanoOutpaintGenerator(pl.LightningModule):
                     im.save(os.path.join(
                         img_dir, f'{self.global_step}_{batch_idx}_{m_i}_blur.png'))
 if __name__=="__main__":
-    pass
+   
+    from models.utils import DTU
+    dataset = DTU(root_dir = "/openbayes/input/input0/dtu",split = "train",len = 2000)
+    dataset[0]
